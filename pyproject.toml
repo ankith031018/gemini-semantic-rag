@@ -15,4 +15,5 @@ dependencies = [
     "langchain-experimental>=0.4.1",
     "pypdf>=6.5.0",
     "pymilvus>=2.6.6",
+    "pinecone>=8.0.0",
 ]
