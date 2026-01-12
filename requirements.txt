@@ -1,6 +1,6 @@
 unstructured
 tiktoken 
-pinecone-client
+pinecone
 pypdf
 python-dotenv
 numpy
