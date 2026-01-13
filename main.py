@@ -56,7 +56,6 @@ def setup_vector_db(chunks, db_path, collection_name="ESG"):
     print(f"Database '{collection_name}' ready at {db_path} with {len(ids)} chunks.")
     return collection
 
-# --- FUNCTION 3: Generate RAG Response ---
 def get_rag_response(query, collection, openai_client):
     """
     Retrieves context and queries OpenAI.
