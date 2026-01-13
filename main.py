@@ -1,119 +1,116 @@
 import os
-from pinecone import Pinecone, ServerlessSpec
-from langchain_pinecone import PineconeVectorStore
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
-from langchain_experimental.text_splitter import SemanticChunker
+import chromadb
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from openai import OpenAI, RateLimitError
 from dotenv import load_dotenv
 
 load_dotenv()
 
-def get_models():
-    """Initializes the embedding engine and the LLM with a valid model name."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY not set in .env")
-    
-    # Use text-embedding-004 for the 768-dimension Pinecone index
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-    
-    # Update to a valid production model name
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
-        temperature=0,
+def process_documents(data_path, chunk_size=1000, chunk_overlap=200):
+    """
+    Loads PDFs and splits them into chunks.
+    Increasing chunk_size to 1000 helps the model understand full contexts.
+    """
+    print(f"Loading documents from {data_path}...")
+    loader = PyPDFDirectoryLoader(data_path)
+    raw_documents = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        is_separator_regex=False,
     )
-    return embeddings, llm
+    
+    chunks = text_splitter.split_documents(raw_documents)
+    print(f"Split into {len(chunks)} chunks.")
+    return chunks
 
-def indexing_pinecone(index_name="learning-pdf-index"):
-    """Ensures the Pinecone index is ready on AWS us-east-1."""
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    if index_name not in [idx.name for idx in pc.list_indexes()]:
-        pc.create_index(
-            name=index_name,
-            dimension=768,
-            metric='cosine',
-            spec=ServerlessSpec(cloud='aws', region='us-east-1')
+def setup_vector_db(chunks, db_path, collection_name="ESG"):
+    """
+    Initializes ChromaDB and upserts documents.
+    """
+    if not chunks:
+        print("\n⚠️  WARNING: No data found! The 'chunks' list is empty.")
+        print("   Please check that your 'data' folder contains valid PDF files.")
+        return None
+
+    documents = []
+    metadata = []
+    ids = []
+
+    for i, chunk in enumerate(chunks):
+        documents.append(chunk.page_content)
+        ids.append(f"ID_{i}") 
+        metadata.append(chunk.metadata)
+
+    chroma_client = chromadb.PersistentClient(path=db_path)
+    collection = chroma_client.get_or_create_collection(name=collection_name)
+
+    collection.upsert(
+        documents=documents,
+        metadatas=metadata,
+        ids=ids
+    )
+    print(f"Database '{collection_name}' ready at {db_path} with {len(ids)} chunks.")
+    return collection
+
+# --- FUNCTION 3: Generate RAG Response ---
+def get_rag_response(query, collection, openai_client):
+    """
+    Retrieves context and queries OpenAI.
+    Includes error handling for billing issues.
+    """
+    results = collection.query(
+        query_texts=[query],
+        n_results=5
+    )
+    
+    context_text = "\n\n---\n\n".join(results['documents'][0])
+
+    system_prompt = f"""
+    You are an expert financial researcher specializing in ESG investing.
+    
+    CONTEXT:
+    {context_text}
+    
+    INSTRUCTIONS:
+    1. Answer using ONLY the provided context.
+    2. Distinguish strictly between "ESG Investing" and "Impact Investing".
+    3. Use the "Spectrum of Capital" framework where relevant.
+    4. Cite sources as [Source: Page X].
+    """
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ]
         )
-    return pc
+        return response.choices[0].message.content
 
-def document_loading(file_path, embeddings, index_name):
-    """Loads and persists PDF data only if index is empty."""
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    index = pc.Index(index_name)
-    stats = index.describe_index_stats()
+    except RateLimitError:
+        return "🔴 BILLING ERROR: Quota exceeded. Please check OpenAI billing."
+    except Exception as e:
+        return f"🔴 ERROR: {e}"
 
-    if stats['total_vector_count'] > 0:
-        print(f"✅ Data exists. Skipping ingestion.")
-        return PineconeVectorStore(index_name=index_name, embedding=embeddings)
-
-    loader = PyPDFLoader(file_path)
-    docs = loader.load()
-    text_splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile", breakpoint_threshold_amount=95)
-    chunks = text_splitter.split_documents(docs)
-    
-    return PineconeVectorStore.from_documents(chunks, embeddings, index_name=index_name)
-
-def get_answer(query, manual_context, embeddings, index_name, llm):
-    """Retrieves PDF context and combines it with User-provided context."""
-    vector_store = PineconeVectorStore(index_name=index_name, embedding=embeddings)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 7})
-    relevant_docs = retriever.invoke(query)
-    
-    # Format retrieved PDF context
-    pdf_context = "\n\n".join([f"[Source: Page {d.metadata.get('page')}] {d.page_content}" for d in relevant_docs])
-    
-    # PROMPT TEMPLATE: Incorporates both sources
-    prompt = f"""
-    You are a professional researcher. Use the following TWO sources of information to answer:
-    1. PROVIDED PDF CONTEXT (Retrieved from the document)
-    2. USER-PROVIDED MANUAL CONTEXT (Context provided by the user in this chat)
-
-    STRICT RULES:
-    - Base your answer ONLY on these two sources. 
-    - If information is missing from both, say: "I cannot find this in the document or the provided manual context."
-    - Cite [Source: Page X] when using PDF data.
-    - Explicitly mention "Based on manual context" when using user-provided info.
-
-    --- PDF CONTEXT ---
-    {pdf_context}
-
-    --- USER-PROVIDED MANUAL CONTEXT ---
-    {manual_context}
-
-    --- USER QUERY ---
-    {query}
-    
-    ANSWER:"""
-    
-    response = llm.invoke(prompt)
-    return response.content
-
-def main():
-    # PATH HANDLING (Using your provided Windows path)
-    file_to_process = r"C:\Users\ankit\Downloads\ESG 2021 Chapter 1.pdf"
-    INDEX_NAME = "esg-2021-chapter-1" 
-
-    embeddings, llm = get_models()
-    indexing_pinecone(INDEX_NAME)
-    document_loading(file_to_process, embeddings, INDEX_NAME)
-
-    print("\n" + "="*50)
-    print("HYBRID RAG SYSTEM ACTIVE")
-    print("Instruction: You can provide context along with your query.")
-    print("Example: 'Regarding the 2021 climate goal, use the context that the budget was doubled.'")
-    print("="*50)
-
-    while True:
-        print("\n--- NEW QUERY ---")
-        query = input("👤 Question: ")
-        if query.lower() in ["exit", "quit"]: break
-        
-        manual_context = input("📝 Manual Context (Leave empty if none): ")
-        if not manual_context: manual_context = "No manual context provided."
-
-        print("🤖 Researching...")
-        answer = get_answer(query, manual_context, embeddings, INDEX_NAME, llm)
-        print(f"\n📢 ANSWER:\n{answer}")
 
 if __name__ == "__main__":
-    main()
+    DATA_PATH = r'data'
+    CHROMA_PATH = r'chroma_db'
+    
+    client = OpenAI()
+
+    pdf_chunks = process_documents(DATA_PATH)
+
+    vector_collection = setup_vector_db(pdf_chunks, CHROMA_PATH)
+
+    while True:
+        user_input = input("\nAsk an ESG question (or type 'quit'): ")
+        
+        if user_input.lower() == 'quit':
+            break
+        answer = get_rag_response(user_input, vector_collection, client)
+        print(f"\nAnswer:\n{answer}\n{'='*30}")

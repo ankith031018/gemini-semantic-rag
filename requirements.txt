@@ -5,3 +5,7 @@ pypdf
 python-dotenv
 numpy
 pandas
+langchain-pinecone
+langchain-openai
+langchain-text-splitters
+langchain
