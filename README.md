@@ -1,1 +1,1 @@
-# gemini-semantic-rag
+# LLM-semantic-rag-(OPENAI)
